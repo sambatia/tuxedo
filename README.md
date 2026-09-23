@@ -288,6 +288,8 @@ toggle_complete      = "x"
 delete               = "dd"
 reschedule           = "r"
 cycle_priority       = "p"
+move_task_down       = "J"
+move_task_up         = "K"
 begin_prompt_context = "c"
 copy_line            = "yy"
 copy_body            = "yb"
@@ -339,6 +341,26 @@ palette where possible: `toggle_complete`, `pick_project`,
 chords like `ZZ`, modifier forms like `Ctrl-n` / `Alt-x`, named keys like
 `Esc`, `Enter`, `Tab`, arrows, `Page-Up`, `Page-Down`, or `F1` through `F24`.
 
+### Recurrence builder keys
+
+The **↻ REPEAT** overlay owns the keyboard while it is open, so its motions
+live in their own `[recurrence]` table and can reuse letters that mean
+something else in normal mode:
+
+```toml
+[recurrence]
+focus_next = ["j", "Down", "Tab"]        # move between interval / unit / mode
+focus_prev = ["k", "Up", "Shift-Tab"]
+value_next = ["l", "Right", "+", "="]    # change the focused field's value
+value_prev = ["h", "Left", "-", "_"]
+accept     = "Enter"                     # write the rec: token
+cancel     = "Esc"
+```
+
+`next_field` / `prev_field` / `increase` / `decrease` / `save` are accepted as
+aliases. Two-key chords are not — the overlay has no leader state to arm, so a
+chord here is ignored rather than bound to a key that could never fire.
+
 ### Navigation
 
 | Key | Action |
@@ -359,11 +381,17 @@ chords like `ZZ`, modifier forms like `Ctrl-n` / `Alt-x`, named keys like
 | `x` | toggle complete |
 | `dd` | delete task |
 | `p` | cycle priority A → B → C → · |
+| `J` / `K` | move task down / up within current sort ties |
 | `c` | add or remove a context |
 | `+` | add a project |
 | `yy` | copy current line to clipboard |
 | `yb` | copy current body only (no priority, dates, projects, contexts, `key:value`) |
 | `u` | undo (50 levels) |
+
+Movement preserves the active sort: priority mode requires matching priority
+and due date, due mode requires matching due date, and file mode allows
+unrestricted movement. Visual selections move in one undoable operation and
+must be fully visible within one sort tie.
 
 ### Edit dialog
 
@@ -395,7 +423,7 @@ The modal keys below apply in Normal mode:
 
 | Key | Action |
 | --- | --- |
-| `/` | search |
+| `/` | search (a `due:` term filters by date range; see [todo.txt format](#todotxt-format)) |
 | `fp` | filter by project (`j` / `k` cycles, `Esc` clears) |
 | `fc` | filter by context (`j` / `k` cycles, `Esc` clears) |
 | `ff` | pick a saved search (`j` / `k` cycles, `Enter` keeps, `Esc` reverts) |
@@ -403,12 +431,17 @@ The modal keys below apply in Normal mode:
 | `S` | cycle sort: priority → due → file order |
 | `v` | enter visual / multi-select; `space` toggles a row |
 | `x` / `dd` (in visual) | bulk-complete / bulk-delete the selection |
+| `yy` / `yb` (in visual) | copy selected lines / bodies |
 | `l` | list (default) view |
 | `a` | toggle archive view |
 | `A` | archive completed tasks → `done.txt` |
 | `H` | toggle showing done tasks in the main list |
 | `o` | open the current task's existing `note:<path>` in `$VISUAL` / `$EDITOR` |
 | `O` | create the current task's note if needed, then open it |
+
+While a `+project` or `@context` filter is active, `n` seeds the add prompt
+with the matching tags so a task added under a filter stays in view —
+backspace to drop them. A `/`-search filter seeds nothing.
 
 ### Layout & theme
 
@@ -457,6 +490,14 @@ Standard [todo.txt](https://github.com/todotxt/todo.txt) lines:
   note actions (`o` / `O`): relative paths resolve under `notes_dir`, then
   `$NOTES_DIR`, then `~/notes`. Keys you'd rather not see can be hidden from
   the rows via [`hide_keys`](#hiding-keyvalue-tags)
+- `due:` in the `/`-search box also accepts a range, using the same offset
+  grammar as `rec:` and `t:`: `due:+1w` matches anything due between today
+  and 7 days from now, `due:-3d` matches anything due between 3 days ago and
+  today (both bounds inclusive). The sign defaults to `+` when omitted, so
+  `due:1w` and `due:+1w` mean the same thing. Units are `d` (days), `b`
+  (business days), `w` (weeks), and `m` (months). Only the first `due:` term
+  in a search is used this way; the rest of the query is matched as free text
+  against the task body, same as before
 - `rec:[+]N{d,b,w,m,y}` — recurrence; on completion (`x`), tuxedo inserts
   a fresh copy of the task with `due:` advanced by `N` days, business
   days (Mon–Fri), weeks, months, or years. The `+` prefix means
@@ -603,6 +644,24 @@ Wrapping is display-only and defaults to off. Tags hidden via `hide_keys`
 are stripped before the wrap width is measured, and the detail pane is
 unaffected (it always shows the full text).
 
+### Recurrence builder
+
+Typing `rec:` in the create/edit dialog — or picking `/rec` from the slash
+menu — opens the **↻ REPEAT** builder over the dialog. `j`/`k` (or `Tab`)
+move between the interval, unit, and mode fields; `h`/`l` (or `+`/`-`) change
+the focused field's value; `Enter` writes the `rec:` token and `Esc` cancels.
+
+To skip the builder and type recurrence values by hand, set:
+
+```toml
+recurrence_builder = false
+```
+
+`rec:` then stays plain text, and `/rec` inserts a bare `rec:` key for you to
+complete. The setting is config-only (no in-app toggle) and hot-reloads like
+every other field. Other pickers are unaffected — `due:` and `t:` still open
+the calendar.
+
 ### Hiding `key:value` tags
 
 Some `key:value` extensions are for machines, not eyes — e.g. a `uid:` you
@@ -636,13 +695,18 @@ plain `cargo` commands if you don't use [mise](https://mise.jdx.dev/).
 
 ## Roadmap
 
-Planned and in-flight work lives in [`todo.txt`](./todo.txt) — eat your own dog food.
+See [github.com/webstonehq/tuxedo/issues](https://github.com/webstonehq/tuxedo/issues).
 
 ## Contributing
 
 Issues and pull requests are welcome. For larger changes, please open an
-issue first to discuss the approach. Run `mise run fmt clippy test` (or the
-plain cargo equivalents) before submitting.
+issue first to discuss the approach. Run `mise run preflight` (or the
+plain cargo equivalents described in [Development](#development)) before submitting.
+
+### Use of AI
+
+Go for it, **except** in issue and PR descriptions 🙏. If you don't take the time
+to write, I won't take the time to read and close the issue or PR.
 
 ## License
 

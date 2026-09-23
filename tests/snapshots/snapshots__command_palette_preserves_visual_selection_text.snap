@@ -1,6 +1,5 @@
 ---
 source: tests/snapshots.rs
-assertion_line: 226
 expression: buffer_to_text(&buf)
 ---
  FILTERS                   ▶▮◀ /tmp/tuxedo-snapshot.txt  •  15 tas DETAIL                           
@@ -18,15 +17,15 @@ expression: buffer_to_text(&buf)
    @errands         │   toggle complete                                      x │6                   
    @home            │   delete task                                         dd │                    
    @laptop          │   cycle priority                                       p │                    
-   @phone           │   add project to current task                          + │                    
+   @phone           │   move task down                                       J │                    
+                    │   move task up                                         K │                    
+                    │   add project to current task                          + │                    
                     │   add or remove context on current task                c │                    
                     │   copy line to clipboard                              yy │                    
                     │   copy body to clipboard                              yb │                    
                     │   open task note                                       o │                    
                     │   create or open task note                             O │                    
                     │   undo                                                 u │                    
-                    │   cursor down                                      j / ↓ │                    
-                    │   cursor up                                        k / ↑ │                    
                     │  ↑↓ / Ctrl-N/P navigate · Enter run · Esc cancel         │                    
                     └──────────────────────────────────────────────────────────┘                    
                                                                                                     
@@ -34,4 +33,4 @@ expression: buffer_to_text(&buf)
                                                                                                     
                                                                                                     
                                                                                                     
- COMMAND   type to filter · Enter run · Esc canc15 open · 2 selected · 2026-05-06 · tuxedo 2026.6.3
+ COMMAND   type to filter · Enter run · Esc canc15 open · 2 selected · 2026-05-06 · tuxedo 2026.8.1

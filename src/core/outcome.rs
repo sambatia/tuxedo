@@ -72,6 +72,15 @@ pub enum PriorityOutcome {
 }
 
 #[derive(Debug)]
+pub enum MoveOutcome {
+    Moved,
+    Unchanged,
+    Aborted(Reconcile),
+    OutOfRange,
+    Error(StoreError),
+}
+
+#[derive(Debug)]
 pub enum DeleteOutcome {
     Deleted { abs: usize },
     Aborted(Reconcile),
@@ -119,6 +128,16 @@ pub enum TagOutcome {
     Unchanged,
     InvalidName,
     OutOfRange,
+    Aborted(Reconcile),
+    Error(StoreError),
+}
+
+#[derive(Debug)]
+pub enum RenameOutcome {
+    Done { renamed: usize },
+    Unchanged,
+    NothingToRename,
+    InvalidName,
     Aborted(Reconcile),
     Error(StoreError),
 }

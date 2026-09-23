@@ -10,7 +10,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 
 use std::io::Write;
 
-use tuxedo::action::Action;
+use tuxedo::action::{Action, RecAction};
 use tuxedo::app::{AddOutcome, App, CalendarTarget, DialogInputMode, Mode, OverlayKind, View};
 use tuxedo::cli;
 use tuxedo::config::Config;
@@ -229,6 +229,7 @@ fn run(
                     handle_key(app, key, keybinds);
                     if let Some(path) = app.take_pending_editor_path() {
                         open_path_in_editor(&path)?;
+                        terminal.clear()?;
                     }
                     dirty = true;
                 }
@@ -258,14 +259,23 @@ fn run(
 /// Poll the config watcher channel. On signal, reload config strictly and
 /// apply it to the app. Returns `true` when a reload was attempted (whether
 /// successful or not) so the caller can trigger a redraw.
+///
+/// Deferred while `Mode::PickTheme` is open: its live preview
+/// (`pick_theme_step`) mutates `prefs.theme_idx` in memory without saving,
+/// so an unrelated reload landing mid-preview would silently clobber it
+/// back to whatever's on disk. The signal stays queued in `rx` and is
+/// applied on the first poll after the picker closes.
 fn poll_config_reload(app: &mut App, rx: &Option<mpsc::Receiver<()>>) -> bool {
+    if app.mode == Mode::PickTheme {
+        return false;
+    }
     let rx = match rx {
         Some(r) => r,
         None => return false,
     };
     match rx.try_recv() {
-        Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {}
-        Err(mpsc::TryRecvError::Empty) => return false,
+        Ok(()) => {}
+        Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return false,
     }
     let Some(ref path) = app.config_path else {
         return true;
@@ -316,6 +326,11 @@ fn next_timeout(app: &App) -> Duration {
     }
 }
 
+fn is_exit_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('q')
+        || (key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL)
+}
+
 fn handle_key(app: &mut App, key: KeyEvent, keybinds: &KeyBindings) {
     // Detect external edits before processing the key. On detection the
     // file is reloaded, the keystroke is consumed (re-press to act on the
@@ -324,13 +339,15 @@ fn handle_key(app: &mut App, key: KeyEvent, keybinds: &KeyBindings) {
         return;
     }
     match app.mode {
-        Mode::Insert => handle_insert(app, key),
+        Mode::Insert => handle_insert(app, key, keybinds),
         Mode::Search => handle_search(app, key),
         Mode::Help => handle_help(app, key),
         Mode::Settings => handle_settings(app, key),
-        Mode::PromptProject | Mode::PromptContext | Mode::PromptSaveFilter => {
-            handle_prompt(app, key)
-        }
+        Mode::PromptProject
+        | Mode::PromptContext
+        | Mode::PromptRenameProject
+        | Mode::PromptRenameContext
+        | Mode::PromptSaveFilter => handle_prompt(app, key),
         Mode::PickProject | Mode::PickContext | Mode::PickSavedFilter => handle_pick(app, key),
         Mode::PickTheme => handle_pick_theme(app, key),
         Mode::CommandPalette => handle_command_palette(app, key),
@@ -345,6 +362,11 @@ fn handle_key(app: &mut App, key: KeyEvent, keybinds: &KeyBindings) {
 /// without creating anything. Any other key is ignored so a stray press
 /// doesn't silently pick an option.
 fn handle_welcome(app: &mut App, key: KeyEvent) {
+    if is_exit_key(key) {
+        app.should_quit = true;
+        return;
+    }
+
     match key.code {
         KeyCode::Char('c') => match cli::ensure_file(app.file_path.clone()) {
             Ok(_) => app.mode = Mode::Normal,
@@ -359,7 +381,7 @@ fn handle_welcome(app: &mut App, key: KeyEvent) {
             }
             Err(e) => app.flash(format!("could not open sample: {e}")),
         },
-        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+        KeyCode::Esc => app.should_quit = true,
         _ => {}
     }
 }
@@ -574,7 +596,7 @@ fn handle_insert_normal(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn handle_insert(app: &mut App, key: KeyEvent) {
+fn handle_insert(app: &mut App, key: KeyEvent, keybinds: &KeyBindings) {
     if app.draft.input_mode() == DialogInputMode::Normal {
         handle_insert_normal(app, key);
         return;
@@ -591,7 +613,7 @@ fn handle_insert(app: &mut App, key: KeyEvent) {
             return;
         }
         Some(OverlayKind::RecurrenceBuilder) => {
-            handle_insert_rec_builder(app, key);
+            handle_insert_rec_builder(app, key, keybinds);
             return;
         }
         Some(OverlayKind::PriorityChooser) => {
@@ -734,19 +756,41 @@ fn handle_insert_calendar(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn handle_insert_rec_builder(app: &mut App, key: KeyEvent) {
-    match key.code {
-        KeyCode::Char('h') | KeyCode::Left => app.recurrence_focus(-1),
-        KeyCode::Char('l') | KeyCode::Right => app.recurrence_focus(1),
-        KeyCode::Char('j') | KeyCode::Down => app.recurrence_focus(1),
-        KeyCode::Char('k') | KeyCode::Up => app.recurrence_focus(-1),
+fn handle_insert_rec_builder(app: &mut App, key: KeyEvent, keybinds: &KeyBindings) {
+    // Custom `[recurrence]` bindings win over the built-ins, matching how
+    // `[normal]` is layered in `resolve_normal_key`.
+    if let Some(action) = keybinds.resolve_recurrence(key) {
+        apply_rec_action(app, action);
+        return;
+    }
+    let action = match key.code {
+        // Horizontal keys change the focused field's *value*: both the unit
+        // and the mode render as horizontal segmented controls, so Left/Right
+        // moving along them is the affordance the layout already suggests.
+        KeyCode::Char('h') | KeyCode::Left => RecAction::ValuePrev,
+        KeyCode::Char('l') | KeyCode::Right => RecAction::ValueNext,
+        // Vertical keys (and Tab) move *between* fields.
+        KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => RecAction::FocusNext,
+        KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => RecAction::FocusPrev,
         // `=` is the unshifted `+` on US keyboards — accept both so users
         // don't have to chord Shift to bump the interval.
-        KeyCode::Char('+') | KeyCode::Char('=') => app.recurrence_adjust(1),
-        KeyCode::Char('-') | KeyCode::Char('_') => app.recurrence_adjust(-1),
-        KeyCode::Enter => app.recurrence_accept(),
-        KeyCode::Esc => app.recurrence_cancel(),
-        _ => {}
+        KeyCode::Char('+') | KeyCode::Char('=') => RecAction::ValueNext,
+        KeyCode::Char('-') | KeyCode::Char('_') => RecAction::ValuePrev,
+        KeyCode::Enter => RecAction::Accept,
+        KeyCode::Esc => RecAction::Cancel,
+        _ => return,
+    };
+    apply_rec_action(app, action);
+}
+
+fn apply_rec_action(app: &mut App, action: RecAction) {
+    match action {
+        RecAction::FocusNext => app.recurrence_focus(1),
+        RecAction::FocusPrev => app.recurrence_focus(-1),
+        RecAction::ValueNext => app.recurrence_adjust(1),
+        RecAction::ValuePrev => app.recurrence_adjust(-1),
+        RecAction::Accept => app.recurrence_accept(),
+        RecAction::Cancel => app.recurrence_cancel(),
     }
 }
 
@@ -780,20 +824,28 @@ fn handle_search(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_help(app: &mut App, key: KeyEvent) {
-    if matches!(
-        key.code,
-        KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q')
-    ) {
+    if is_exit_key(key) || matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
         app.mode = Mode::Normal;
     }
 }
 
 fn handle_settings(app: &mut App, key: KeyEvent) {
-    if matches!(
-        key.code,
-        KeyCode::Esc | KeyCode::Char(',') | KeyCode::Char('q')
-    ) {
+    if is_exit_key(key) {
         app.mode = Mode::Normal;
+        return;
+    }
+
+    match key.code {
+        KeyCode::Esc | KeyCode::Char(',') => app.mode = Mode::Normal,
+        KeyCode::Char('T') => apply_action(app, Action::CycleTheme),
+        KeyCode::Char('D') => apply_action(app, Action::CycleDensity),
+        KeyCode::Char('L') => apply_action(app, Action::ToggleLineNum),
+        KeyCode::Char('[') => apply_action(app, Action::ToggleLeftPane),
+        KeyCode::Char(']') => apply_action(app, Action::ToggleRightPane),
+        KeyCode::Char('H') => apply_action(app, Action::ToggleShowDone),
+        KeyCode::Char('F') => apply_action(app, Action::ToggleShowFuture),
+        KeyCode::Char('S') => apply_action(app, Action::CycleSort),
+        _ => {}
     }
 }
 
@@ -801,6 +853,11 @@ fn handle_pick(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Char('j') | KeyCode::Down => app.pick_step(true),
         KeyCode::Char('k') | KeyCode::Up => app.pick_step(false),
+        KeyCode::Char('r') => match app.mode {
+            Mode::PickProject => app.begin_rename_project(),
+            Mode::PickContext => app.begin_rename_context(),
+            _ => {}
+        },
         KeyCode::Enter => app.pick_accept(),
         KeyCode::Esc => app.pick_cancel(),
         _ => {}
@@ -809,7 +866,7 @@ fn handle_pick(app: &mut App, key: KeyEvent) {
 
 fn handle_pick_theme(app: &mut App, key: KeyEvent) {
     match key.code {
-        KeyCode::Char('j') | KeyCode::Down => app.pick_theme_step(true),
+        KeyCode::Char('j') | KeyCode::Down | KeyCode::Char('T') => app.pick_theme_step(true),
         KeyCode::Char('k') | KeyCode::Up => app.pick_theme_step(false),
         KeyCode::Enter => app.pick_theme_accept(),
         KeyCode::Esc => app.pick_theme_cancel(),
@@ -922,6 +979,8 @@ fn handle_prompt(app: &mut App, key: KeyEvent) {
                 Mode::PromptProject => app.add_project_to_current(&value),
                 Mode::PromptContext => app.toggle_context_on_current(&value),
                 Mode::PromptSaveFilter => app.save_current_filter_as(&value),
+                Mode::PromptRenameProject => app.rename_current_project_as(&value),
+                Mode::PromptRenameContext => app.rename_current_context_as(&value),
                 _ => {}
             }
         }
@@ -948,6 +1007,10 @@ fn resolve_normal_key(app: &mut App, key: KeyEvent, keybinds: &KeyBindings) -> O
         None => {}
     }
 
+    if is_exit_key(key) {
+        return Some(Action::Quit);
+    }
+
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     if ctrl {
         return match key.code {
@@ -958,9 +1021,10 @@ fn resolve_normal_key(app: &mut App, key: KeyEvent, keybinds: &KeyBindings) -> O
         };
     }
     Some(match key.code {
-        KeyCode::Char('q') => Action::Quit,
         KeyCode::Char('j') | KeyCode::Down => Action::CursorDown,
         KeyCode::Char('k') | KeyCode::Up => Action::CursorUp,
+        KeyCode::Char('J') => Action::MoveTaskDown,
+        KeyCode::Char('K') => Action::MoveTaskUp,
         KeyCode::Char('G') => Action::CursorBottom,
         // First 'g' arms the chord; second 'g' fires CursorTop.
         KeyCode::Char('g') if app.chord.toggle('g') => Action::CursorTop,
@@ -1060,6 +1124,8 @@ fn apply_action(app: &mut App, action: Action) {
             | Action::BeginEdit
             | Action::BeginEditInsert
             | Action::CyclePriority
+            | Action::MoveTaskDown
+            | Action::MoveTaskUp
             | Action::ToggleVisual
             | Action::ToggleSelected
             | Action::BeginSearch
@@ -1100,7 +1166,12 @@ fn apply_action(app: &mut App, action: Action) {
         Action::HalfPageUp => app.cursor = app.cursor.saturating_sub(10),
         Action::BeginAdd => {
             app.mode = Mode::Insert;
-            app.draft_clear();
+            // Seed from the active filter: a task added under `+work` almost
+            // always belongs to it, and without the tag it drops out of the
+            // view the moment it saves. The cursor parks after the seed, so
+            // an unwanted tag is a backspace away.
+            let seed = app.filter().tag_seed();
+            app.draft_set_insert(seed);
             app.selection.exit_edit();
         }
         Action::BeginEdit => {
@@ -1140,6 +1211,8 @@ fn apply_action(app: &mut App, action: Action) {
                 app.cycle_priority(abs);
             }
         }
+        Action::MoveTaskDown => app.move_tasks(true),
+        Action::MoveTaskUp => app.move_tasks(false),
         Action::BeginSearch => {
             app.mode = Mode::Search;
             app.draft_clear();
@@ -1303,18 +1376,43 @@ fn handle_normal(app: &mut App, key: KeyEvent, keybinds: &KeyBindings) {
 }
 
 fn copy_current_task(app: &mut App, body_only: bool) {
-    let Some(raw) = app.cur_task().map(|t| t.raw.clone()) else {
+    let multi = app.view() == View::List && app.mode == Mode::Visual && !app.selection.is_empty();
+    let count = if multi { app.selection.len() } else { 1 };
+    let Some(payload) = copy_payload(app, body_only) else {
+        if multi {
+            app.flash("selection includes hidden tasks");
+        }
         return;
     };
-    let payload = if body_only {
-        todo::body_only(&raw)
-    } else {
-        raw
-    };
     match clipboard::copy(&payload) {
-        Ok(()) => app.flash(if body_only { "copied (body)" } else { "copied" }),
+        Ok(()) => app.flash(match (body_only, count) {
+            (false, 1) => "copied".into(),
+            (true, 1) => "copied (body)".into(),
+            (false, count) => format!("copied {count}"),
+            (true, count) => format!("copied {count} (body)"),
+        }),
         Err(e) => app.flash(format!("copy failed: {e}")),
     }
+}
+
+fn copy_payload(app: &App, body_only: bool) -> Option<String> {
+    let format = |raw: &str| {
+        if body_only {
+            todo::body_only(raw)
+        } else {
+            raw.to_string()
+        }
+    };
+    if app.view() == View::List && app.mode == Mode::Visual && !app.selection.is_empty() {
+        let lines: Vec<_> = app
+            .visible_indices()
+            .iter()
+            .filter(|&&abs| app.selection.is_selected(abs))
+            .map(|&abs| format(&app.tasks()[abs].raw))
+            .collect();
+        return (lines.len() == app.selection.len()).then(|| lines.join("\n"));
+    }
+    app.cur_task().map(|task| format(&task.raw))
 }
 
 #[cfg(test)]
@@ -1322,6 +1420,7 @@ mod tests {
     use super::*;
     use chrono::NaiveDate;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tuxedo::app::Sort;
     use tuxedo::config::Config;
 
     fn key(c: char) -> KeyEvent {
@@ -1338,6 +1437,10 @@ mod tests {
 
     fn resolve(app: &mut App, key: KeyEvent) -> Option<Action> {
         resolve_normal_key(app, key, &KeyBindings::default())
+    }
+
+    fn task_lines(app: &App) -> Vec<&str> {
+        app.tasks().iter().map(|task| task.raw.as_str()).collect()
     }
 
     fn welcome_app(name: &str) -> (App, std::path::PathBuf) {
@@ -1397,6 +1500,88 @@ mod tests {
         assert!(!path.exists(), "Esc must not create a file");
     }
 
+    #[test]
+    fn settings_hinted_keys_apply_and_dialog_stays_open() {
+        let mut app = build_app();
+        app.mode = Mode::Settings;
+
+        let theme_before = app.prefs.theme_idx();
+        handle_settings(&mut app, key('T'));
+        assert_ne!(
+            app.prefs.theme_idx(),
+            theme_before,
+            "`T` must cycle the theme, per the settings screen's own hint"
+        );
+        assert_eq!(
+            app.mode,
+            Mode::Settings,
+            "adjusting a setting must not close the dialog"
+        );
+
+        let show_done_before = app.prefs.show_done;
+        handle_settings(&mut app, key('H'));
+        assert_ne!(
+            app.prefs.show_done, show_done_before,
+            "`H` must toggle show-done, per the settings screen's own hint"
+        );
+        assert_eq!(app.mode, Mode::Settings);
+
+        handle_settings(&mut app, key('q'));
+        assert_eq!(app.mode, Mode::Normal, "`q` must still close the dialog");
+    }
+
+    #[test]
+    fn pick_theme_t_cycles_like_j_and_esc_still_cancels() {
+        let mut app = build_app();
+        app.enter_pick_theme();
+        assert_eq!(app.mode, Mode::PickTheme);
+
+        let orig = app.prefs.theme_idx();
+        handle_pick_theme(&mut app, key('T'));
+        assert_ne!(
+            app.prefs.theme_idx(),
+            orig,
+            "`T` must step to the next theme, same as `j`, not just close the dialog"
+        );
+        assert_eq!(app.mode, Mode::PickTheme, "`T` must not close the dialog");
+
+        handle_pick_theme(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(
+            app.prefs.theme_idx(),
+            orig,
+            "Esc must still revert to the theme active when the picker opened"
+        );
+    }
+
+    #[test]
+    fn config_reload_is_deferred_while_pick_theme_is_open() {
+        let mut app = build_app();
+        app.enter_pick_theme();
+        app.pick_theme_step(true);
+        let previewed = app.prefs.theme_idx();
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(()).expect("test channel receiver is alive");
+        let rx = Some(rx);
+
+        assert!(
+            !poll_config_reload(&mut app, &rx),
+            "a reload must not be applied while the picker's live preview is unsaved"
+        );
+        assert_eq!(
+            app.prefs.theme_idx(),
+            previewed,
+            "the deferred reload must not clobber the in-memory preview"
+        );
+
+        app.mode = Mode::Normal;
+        assert!(
+            poll_config_reload(&mut app, &rx),
+            "the queued signal must still be applied once the picker closes"
+        );
+    }
+
     fn build_app() -> App {
         let path = std::env::temp_dir().join(format!(
             "tuxedo-bindings-{}-{:?}.txt",
@@ -1428,10 +1613,20 @@ mod tests {
     }
 
     #[test]
+    fn disconnected_config_watcher_is_ignored() {
+        let mut app = build_app();
+        let (tx, rx) = mpsc::channel();
+        drop(tx);
+        assert!(!poll_config_reload(&mut app, &Some(rx)));
+    }
+
+    #[test]
     fn plain_keys_resolve_to_their_actions() {
         let mut app = build_app();
         assert_eq!(resolve(&mut app, key('q')), Some(Action::Quit));
         assert_eq!(resolve(&mut app, key('j')), Some(Action::CursorDown),);
+        assert_eq!(resolve(&mut app, key('J')), Some(Action::MoveTaskDown),);
+        assert_eq!(resolve(&mut app, key('K')), Some(Action::MoveTaskUp),);
         assert_eq!(resolve(&mut app, key('?')), Some(Action::OpenHelp));
         assert_eq!(resolve(&mut app, ctrl('d')), Some(Action::HalfPageDown),);
         assert_eq!(resolve(&mut app, key('n')), Some(Action::BeginAdd),);
@@ -1557,6 +1752,34 @@ mod tests {
     }
 
     #[test]
+    fn visual_copy_payload_uses_display_order() {
+        let mut app = build_app_with_archive("(B) Second @phone\n(A) First +work\n", None);
+        app.mode = Mode::Visual;
+        app.selection.toggle(0);
+        app.selection.toggle(1);
+
+        assert_eq!(
+            copy_payload(&app, false).as_deref(),
+            Some("(A) First +work\n(B) Second @phone")
+        );
+        assert_eq!(copy_payload(&app, true).as_deref(), Some("First\nSecond"));
+    }
+
+    #[test]
+    fn visual_copy_rejects_hidden_selections() {
+        let mut app = build_app_with_archive("first +work\nhidden +home\n", None);
+        app.prefs.sort = Sort::File;
+        app.mode = Mode::Visual;
+        app.selection.toggle(0);
+        app.selection.toggle(1);
+        app.set_project_filter(Some("work".into()));
+
+        assert_eq!(copy_payload(&app, false), None);
+        copy_current_task(&mut app, false);
+        assert_eq!(app.flash_active(), Some("selection includes hidden tasks"));
+    }
+
+    #[test]
     fn plain_b_without_y_armed_is_unhandled() {
         let mut app = build_app();
         // No leader → 'b' is not bound to anything else, so nothing fires.
@@ -1575,6 +1798,190 @@ mod tests {
         assert_eq!(app.cursor, 0);
         apply_action(&mut app, Action::CursorUp);
         assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn capital_j_and_k_reorder_within_priority_sort_ties() {
+        let mut app = build_app_with_archive("(A) first\n(B) middle\n(A) second\n", None);
+        apply_action(&mut app, Action::MoveTaskDown);
+        assert_eq!(app.tasks()[0].raw, "(A) second");
+        assert_eq!(app.tasks()[2].raw, "(A) first");
+        assert_eq!(app.cursor, 1);
+
+        apply_action(&mut app, Action::MoveTaskUp);
+        assert_eq!(app.tasks()[0].raw, "(A) first");
+        assert_eq!(app.tasks()[2].raw, "(A) second");
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn task_movement_preserves_priority_due_fallback() {
+        let mut app = build_app_with_archive(
+            "(A) later due:2026-06-20\n(A) sooner due:2026-06-01\n",
+            None,
+        );
+        apply_action(&mut app, Action::MoveTaskDown);
+        assert_eq!(
+            task_lines(&app),
+            ["(A) later due:2026-06-20", "(A) sooner due:2026-06-01"]
+        );
+        assert_eq!(app.cursor, 0);
+        assert_eq!(app.flash_active(), Some("edge of priority/due group"));
+    }
+
+    #[test]
+    fn task_movement_reorders_equal_due_dates() {
+        let mut app = build_app_with_archive(
+            "first due:2026-06-01\nundated\nsecond due:2026-06-01\n",
+            None,
+        );
+        app.prefs.sort = Sort::Due;
+        app.recompute_visible();
+        apply_action(&mut app, Action::MoveTaskDown);
+        assert_eq!(
+            task_lines(&app),
+            ["second due:2026-06-01", "undated", "first due:2026-06-01"]
+        );
+        assert_eq!(app.cursor, 1);
+
+        apply_action(&mut app, Action::MoveTaskDown);
+        assert_eq!(app.flash_active(), Some("edge of due-date group"));
+    }
+
+    #[test]
+    fn task_movement_is_unrestricted_in_file_sort() {
+        let mut app = build_app_with_archive(
+            "(B) first due:2026-06-20\n(A) second due:2026-06-01\n",
+            None,
+        );
+        app.prefs.sort = Sort::File;
+        app.recompute_visible();
+        apply_action(&mut app, Action::MoveTaskDown);
+        assert_eq!(
+            task_lines(&app),
+            ["(A) second due:2026-06-01", "(B) first due:2026-06-20"]
+        );
+        assert_eq!(app.cursor, 1);
+    }
+
+    #[test]
+    fn filtered_movement_swaps_visible_tasks_without_moving_hidden_tasks() {
+        let mut app = build_app_with_archive("first +work\nhidden +home\nsecond +work\n", None);
+        app.prefs.sort = Sort::File;
+        app.set_project_filter(Some("work".into()));
+
+        apply_action(&mut app, Action::MoveTaskDown);
+
+        assert_eq!(
+            task_lines(&app),
+            ["second +work", "hidden +home", "first +work"]
+        );
+        assert_eq!(app.cursor, 1);
+    }
+
+    #[test]
+    fn movement_rejects_selections_with_hidden_tasks() {
+        let mut app = build_app_with_archive("first +work\nhidden +home\nsecond +work\n", None);
+        app.prefs.sort = Sort::File;
+        app.mode = Mode::Visual;
+        app.selection.toggle(0);
+        app.selection.toggle(1);
+        app.set_project_filter(Some("work".into()));
+
+        apply_action(&mut app, Action::MoveTaskDown);
+
+        assert_eq!(
+            task_lines(&app),
+            ["first +work", "hidden +home", "second +work"]
+        );
+        assert_eq!(app.flash_active(), Some("selection includes hidden tasks"));
+    }
+
+    #[test]
+    fn movement_rejects_selections_across_sort_groups() {
+        let mut app =
+            build_app_with_archive("(A) first\n(A) second\n(B) third\n(B) fourth\n", None);
+        app.mode = Mode::Visual;
+        app.selection.toggle(0);
+        app.selection.toggle(2);
+
+        apply_action(&mut app, Action::MoveTaskDown);
+
+        assert_eq!(
+            task_lines(&app),
+            ["(A) first", "(A) second", "(B) third", "(B) fourth"]
+        );
+        assert_eq!(app.flash_active(), Some("selection spans sort groups"));
+    }
+
+    #[test]
+    fn visual_selection_crosses_sort_groups_in_file_sort() {
+        let mut app = build_app_with_archive("(A) first\n(B) second\n(C) third\n", None);
+        app.prefs.sort = Sort::File;
+        app.mode = Mode::Visual;
+        app.selection.toggle(0);
+        app.selection.toggle(1);
+
+        apply_action(&mut app, Action::MoveTaskDown);
+
+        assert_eq!(task_lines(&app), ["(C) third", "(A) first", "(B) second"]);
+        assert!(app.selection.is_selected(1));
+        assert!(app.selection.is_selected(2));
+    }
+
+    #[test]
+    fn visual_selection_moves_as_one_undoable_block() {
+        let mut app =
+            build_app_with_archive("(A) first\n(A) second\n(A) third\n(A) fourth\n", None);
+        app.mode = Mode::Visual;
+        app.selection.toggle(0);
+        app.selection.toggle(1);
+        app.cursor = 1;
+
+        apply_action(&mut app, Action::MoveTaskDown);
+        assert_eq!(
+            task_lines(&app),
+            ["(A) third", "(A) first", "(A) second", "(A) fourth"]
+        );
+        assert!(app.selection.is_selected(1));
+        assert!(app.selection.is_selected(2));
+        assert_eq!(app.cursor, 2);
+
+        apply_action(&mut app, Action::Undo);
+        assert_eq!(
+            task_lines(&app),
+            ["(A) first", "(A) second", "(A) third", "(A) fourth"]
+        );
+        assert!(app.selection.is_empty());
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn disjoint_visual_selection_moves_independently() {
+        let mut app =
+            build_app_with_archive("(A) first\n(A) second\n(A) third\n(A) fourth\n", None);
+        app.mode = Mode::Visual;
+        app.selection.toggle(0);
+        app.selection.toggle(2);
+        app.cursor = 2;
+
+        apply_action(&mut app, Action::MoveTaskDown);
+        assert_eq!(
+            task_lines(&app),
+            ["(A) second", "(A) first", "(A) fourth", "(A) third"]
+        );
+        assert!(app.selection.is_selected(1));
+        assert!(app.selection.is_selected(3));
+        assert_eq!(app.cursor, 3);
+
+        apply_action(&mut app, Action::MoveTaskUp);
+        assert_eq!(
+            task_lines(&app),
+            ["(A) first", "(A) second", "(A) third", "(A) fourth"]
+        );
+        assert!(app.selection.is_selected(0));
+        assert!(app.selection.is_selected(2));
+        assert_eq!(app.cursor, 2);
     }
 
     /// Build an isolated App rooted in a fresh temp dir, optionally seeding
@@ -1651,12 +2058,14 @@ mod tests {
     }
 
     #[test]
-    fn archive_e_and_p_flash_readonly() {
+    fn archive_mutations_flash_readonly() {
         let mut app = build_app_with_archive("a\n", Some("x 2026-05-02 2026-04-02 done one\n"));
         app.set_view(View::Archive);
         apply_action(&mut app, Action::BeginEdit);
         assert_eq!(app.flash_active(), Some("read-only in archive"));
         apply_action(&mut app, Action::CyclePriority);
+        assert_eq!(app.flash_active(), Some("read-only in archive"));
+        apply_action(&mut app, Action::MoveTaskDown);
         assert_eq!(app.flash_active(), Some("read-only in archive"));
         assert!(app.archive().tasks()[0].done);
     }
@@ -1712,6 +2121,34 @@ mod tests {
     }
 
     #[test]
+    fn begin_add_seeds_draft_from_active_filter() {
+        let mut app = build_app();
+        app.set_project_filter(Some("work".to_string()));
+        app.set_context_filter(Some("home".to_string()));
+        apply_action(&mut app, Action::BeginAdd);
+        assert_eq!(app.mode, Mode::Insert);
+        assert_eq!(app.draft.text(), "+work @home ");
+        assert_eq!(
+            app.draft.cursor(),
+            "+work @home ".len(),
+            "cursor parks after the seed so the body types straight in"
+        );
+        for c in "Buy milk".chars() {
+            app.draft_insert_char(c);
+        }
+        assert_eq!(app.draft.text(), "+work @home Buy milk");
+    }
+
+    #[test]
+    fn begin_add_leaves_draft_empty_without_a_filter() {
+        let mut app = build_app();
+        apply_action(&mut app, Action::BeginAdd);
+        assert_eq!(app.mode, Mode::Insert);
+        assert_eq!(app.draft.text(), "");
+        assert_eq!(app.draft.cursor(), 0);
+    }
+
+    #[test]
     fn capital_w_toggles_week_start() {
         let mut app = build_app();
         assert_eq!(resolve(&mut app, key('W')), Some(Action::ChangeWeekStart));
@@ -1721,6 +2158,84 @@ mod tests {
     fn lowercase_w_toggles_wrap() {
         let mut app = build_app();
         assert_eq!(resolve(&mut app, key('w')), Some(Action::ToggleWrap));
+    }
+
+    #[test]
+    fn rec_builder_hl_changes_value_and_jk_moves_focus() {
+        use tuxedo::app::BuilderField;
+
+        fn code(c: KeyCode) -> KeyEvent {
+            KeyEvent::new(c, KeyModifiers::NONE)
+        }
+
+        // Regression: h/l/j/k all called `recurrence_focus`, so no navigation
+        // key could change a field's value — only `+`/`-` did, and the hint
+        // advertising them was clipped off the bottom of the popup.
+        let binds = KeyBindings::default();
+        let mut app = build_app();
+        app.open_recurrence_builder();
+        assert_eq!(
+            app.recurrence_state().expect("builder open").field,
+            BuilderField::Interval
+        );
+
+        // Horizontal keys change the value and leave focus put.
+        handle_insert_rec_builder(&mut app, key('l'), &binds);
+        let s = app.recurrence_state().expect("builder open");
+        assert_eq!(s.field, BuilderField::Interval, "h/l must not move focus");
+        assert_eq!(s.interval, 2, "l must increment the interval");
+        handle_insert_rec_builder(&mut app, code(KeyCode::Left), &binds);
+        assert_eq!(app.recurrence_state().expect("builder open").interval, 1);
+
+        // Vertical keys move focus and leave the value put.
+        handle_insert_rec_builder(&mut app, key('j'), &binds);
+        let s = app.recurrence_state().expect("builder open");
+        assert_eq!(s.field, BuilderField::Unit, "j must move focus");
+        assert_eq!(s.interval, 1, "j must not change the interval");
+
+        // With Unit focused, horizontal now cycles the unit.
+        let before = app.recurrence_state().expect("builder open").unit;
+        handle_insert_rec_builder(&mut app, key('l'), &binds);
+        assert_ne!(
+            app.recurrence_state().expect("builder open").unit,
+            before,
+            "l must cycle the unit"
+        );
+
+        // Tab / k also move focus.
+        handle_insert_rec_builder(&mut app, code(KeyCode::Tab), &binds);
+        assert_eq!(
+            app.recurrence_state().expect("builder open").field,
+            BuilderField::Mode
+        );
+        handle_insert_rec_builder(&mut app, key('k'), &binds);
+        assert_eq!(
+            app.recurrence_state().expect("builder open").field,
+            BuilderField::Unit
+        );
+    }
+
+    #[test]
+    fn rec_builder_custom_binding_wins_over_builtin() {
+        use tuxedo::app::BuilderField;
+
+        // `[recurrence]` swaps the built-in meaning of `l`: it should move
+        // focus rather than change the value, proving custom bindings are
+        // consulted before the defaults.
+        let binds = KeyBindings::parse("[recurrence]\nfocus_next = \"l\"\n");
+        let mut app = build_app();
+        app.open_recurrence_builder();
+        handle_insert_rec_builder(&mut app, key('l'), &binds);
+        let s = app.recurrence_state().expect("builder open");
+        assert_eq!(s.field, BuilderField::Unit);
+        assert_eq!(s.interval, 1, "rebound l must not touch the interval");
+
+        // Keys the user did not rebind keep their built-in behavior.
+        handle_insert_rec_builder(&mut app, key('k'), &binds);
+        assert_eq!(
+            app.recurrence_state().expect("builder open").field,
+            BuilderField::Interval
+        );
     }
 
     #[test]
@@ -1793,7 +2308,7 @@ mod tests {
         app.draft_clear();
         app.draft_insert_char('a');
         app.draft_insert_char('b');
-        handle_insert(&mut app, ctrl('h'));
+        handle_insert(&mut app, ctrl('h'), &KeyBindings::default());
         assert_eq!(app.draft.text(), "a");
     }
 

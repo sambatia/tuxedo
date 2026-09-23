@@ -4,15 +4,24 @@
 //! All task logic (recurrence, persistence, reconciliation) lives in the store.
 
 use super::App;
-use super::types::{AddOutcome, View};
+use super::types::{AddOutcome, Mode, Sort, View};
 use crate::app::WeekStart;
 use crate::core::AddOutcome as CoreAdd;
 use crate::core::{
-    ArchiveDeleteOutcome, ArchiveOutcome, CompleteOutcome, DeleteOutcome, EditOutcome,
-    PriorityOutcome, TagOutcome, UnarchiveOutcome, UndoOutcome,
+    ArchiveDeleteOutcome, ArchiveOutcome, CompleteOutcome, DeleteOutcome, EditOutcome, MoveOutcome,
+    PriorityOutcome, RenameOutcome, TagOutcome, UnarchiveOutcome, UndoOutcome,
 };
 use crate::nl;
 use crate::note;
+use crate::todo::Task;
+
+fn same_sort_key(sort: Sort, a: &Task, b: &Task) -> bool {
+    match sort {
+        Sort::Priority => a.priority == b.priority && a.due == b.due,
+        Sort::Due => a.due == b.due,
+        Sort::File => true,
+    }
+}
 
 impl App {
     pub fn toggle_complete(&mut self, abs: usize) {
@@ -44,6 +53,108 @@ impl App {
         }
     }
 
+    pub fn move_tasks(&mut self, down: bool) {
+        let moving_selection = self.mode == Mode::Visual && !self.selection.is_empty();
+        if moving_selection {
+            let visible_selected = self
+                .visible_cache
+                .iter()
+                .filter(|&&abs| self.selection.is_selected(abs))
+                .count();
+            if visible_selected != self.selection.len() {
+                self.flash("selection includes hidden tasks");
+                return;
+            }
+            let spans_sort_groups = {
+                let mut selected = self.selection.iter();
+                selected.next().is_some_and(|first| {
+                    selected.any(|abs| {
+                        !same_sort_key(
+                            self.prefs.sort,
+                            &self.store.tasks()[first],
+                            &self.store.tasks()[abs],
+                        )
+                    })
+                })
+            };
+            if spans_sort_groups {
+                self.flash("selection spans sort groups");
+                return;
+            }
+        }
+        let mut moving: Vec<bool> = self
+            .visible_cache
+            .iter()
+            .enumerate()
+            .map(|(cursor, &abs)| {
+                if moving_selection {
+                    self.selection.is_selected(abs)
+                } else {
+                    cursor == self.cursor
+                }
+            })
+            .collect();
+        let mut swaps = Vec::new();
+        if down {
+            for cursor in (0..moving.len().saturating_sub(1)).rev() {
+                if moving[cursor]
+                    && !moving[cursor + 1]
+                    && same_sort_key(
+                        self.prefs.sort,
+                        &self.store.tasks()[self.visible_cache[cursor]],
+                        &self.store.tasks()[self.visible_cache[cursor + 1]],
+                    )
+                {
+                    swaps.push((self.visible_cache[cursor], self.visible_cache[cursor + 1]));
+                    moving.swap(cursor, cursor + 1);
+                }
+            }
+        } else {
+            for cursor in 1..moving.len() {
+                if moving[cursor]
+                    && !moving[cursor - 1]
+                    && same_sort_key(
+                        self.prefs.sort,
+                        &self.store.tasks()[self.visible_cache[cursor]],
+                        &self.store.tasks()[self.visible_cache[cursor - 1]],
+                    )
+                {
+                    swaps.push((self.visible_cache[cursor], self.visible_cache[cursor - 1]));
+                    moving.swap(cursor, cursor - 1);
+                }
+            }
+        }
+        if swaps.is_empty() {
+            if moving.iter().any(|&selected| selected) {
+                self.flash(match self.prefs.sort {
+                    Sort::Priority => "edge of priority/due group",
+                    Sort::Due => "edge of due-date group",
+                    Sort::File => "edge of list",
+                });
+            }
+            return;
+        }
+        let Some(mut follow_abs) = self.visible_cache.get(self.cursor).copied() else {
+            return;
+        };
+        for &(abs, target) in &swaps {
+            if follow_abs == abs {
+                follow_abs = target;
+            } else if follow_abs == target {
+                follow_abs = abs;
+            }
+        }
+        match self.store.move_tasks(&swaps) {
+            MoveOutcome::Moved => {
+                self.selection.remap_swaps(&swaps);
+                self.after_mutation(follow_abs);
+            }
+            MoveOutcome::Unchanged | MoveOutcome::OutOfRange => {}
+            MoveOutcome::Aborted(r) => self.handle_reconcile_abort(r),
+            MoveOutcome::Error(e) => self.flash(format!("reorder failed: {e}")),
+        }
+    }
+
     pub fn delete(&mut self, abs: usize) {
         match self.store.delete(abs) {
             DeleteOutcome::Deleted { .. } => {
@@ -59,7 +170,11 @@ impl App {
 
     pub fn add_from_draft(&mut self) -> AddOutcome {
         let text = self.draft.text().trim().to_string();
-        if text.is_empty() {
+        // A draft still holding nothing but the filter seed carries no task —
+        // treat it as empty so `n` + Enter under a filter stays the silent
+        // no-op it is without one. Inert when nothing is filtered: `tag_seed`
+        // is empty and `text` is already known not to be.
+        if text.is_empty() || text == self.filter.tag_seed().trim_end() {
             return AddOutcome::Empty;
         }
 
@@ -132,6 +247,42 @@ impl App {
             TagOutcome::InvalidName => self.flash("invalid project name"),
             TagOutcome::Aborted(r) => self.handle_reconcile_abort(r),
             TagOutcome::Error(e) => self.flash(format!("invalid: {e}")),
+        }
+    }
+
+    pub fn rename_current_project_as(&mut self, new_name: &str) {
+        let Some(name) = self.filter.project.clone() else {
+            return;
+        };
+        match self.store.rename_project(&name, new_name) {
+            RenameOutcome::Done { renamed } => {
+                self.flash(format!("+{name} → +{new_name}  ({renamed})"));
+                self.filter.project = Some(new_name.to_string());
+                self.recompute_visible();
+                self.clamp_cursor();
+            }
+            RenameOutcome::NothingToRename | RenameOutcome::Unchanged => {}
+            RenameOutcome::InvalidName => self.flash("invalid project name"),
+            RenameOutcome::Aborted(r) => self.handle_reconcile_abort(r),
+            RenameOutcome::Error(e) => self.flash(format!("rename failed: {e}")),
+        }
+    }
+
+    pub fn rename_current_context_as(&mut self, new_name: &str) {
+        let Some(name) = self.filter.context.clone() else {
+            return;
+        };
+        match self.store.rename_context(&name, new_name) {
+            RenameOutcome::Done { renamed } => {
+                self.flash(format!("@{name} → @{new_name}  ({renamed})"));
+                self.filter.context = Some(new_name.to_string());
+                self.recompute_visible();
+                self.clamp_cursor();
+            }
+            RenameOutcome::NothingToRename | RenameOutcome::Unchanged => {}
+            RenameOutcome::InvalidName => self.flash("invalid context name"),
+            RenameOutcome::Aborted(r) => self.handle_reconcile_abort(r),
+            RenameOutcome::Error(e) => self.flash(format!("rename failed: {e}")),
         }
     }
 
@@ -219,6 +370,10 @@ impl App {
     pub fn undo(&mut self) {
         match self.store.undo() {
             UndoOutcome::Undone => {
+                self.selection.clear();
+                if self.mode == Mode::Visual {
+                    self.mode = Mode::Normal;
+                }
                 self.flash("undo");
                 self.recompute_visible();
                 self.clamp_cursor();
@@ -463,6 +618,29 @@ mod tests {
         assert_eq!(app.tasks().len(), 1);
         assert!(app.tasks()[0].raw.ends_with("Buy milk"));
         assert_eq!(app.flash_active(), Some("added"));
+    }
+
+    #[test]
+    fn add_from_draft_ignores_untouched_filter_seed() {
+        let mut app = build_app("a +work\n");
+        app.set_project_filter(Some("work".to_string()));
+        app.draft_set(app.filter().tag_seed());
+        let outcome = app.add_from_draft();
+        assert_eq!(outcome, crate::app::AddOutcome::Empty);
+        assert_eq!(app.tasks().len(), 1, "no bodyless +work task may be saved");
+        assert_eq!(app.flash_active(), None, "the no-op must stay silent");
+    }
+
+    #[test]
+    fn add_from_draft_saves_a_body_typed_after_the_seed() {
+        let mut app = build_app("a +work\n");
+        app.set_project_filter(Some("work".to_string()));
+        app.draft_set(format!("{}Buy milk", app.filter().tag_seed()));
+        let outcome = app.add_from_draft();
+        assert_eq!(outcome, crate::app::AddOutcome::Saved);
+        assert_eq!(app.tasks().len(), 2);
+        assert_eq!(app.tasks()[1].projects, vec!["work"]);
+        assert!(app.tasks()[1].raw.ends_with("+work Buy milk"));
     }
 
     #[test]

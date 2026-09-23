@@ -27,12 +27,14 @@ pub enum Mode {
     Visual,
     Help,
     Settings,
-    PromptProject,    // text input → add project on current task
-    PromptContext,    // text input → add/remove context on current task
-    PickProject,      // j/k cycles through projects to filter by
-    PickContext,      // j/k cycles through contexts to filter by
-    PickSavedFilter,  // j/k cycles through saved searches to apply
-    PromptSaveFilter, // text input → name the current search and save it
+    PromptProject,       // text input → add project on current task
+    PromptContext,       // text input → add/remove context on current task
+    PromptRenameProject, // text input → rename all project occurrences on current project in project list
+    PromptRenameContext, // text input → rename all context occurrences on current context in context list
+    PickProject,         // j/k cycles through projects to filter by
+    PickContext,         // j/k cycles through contexts to filter by
+    PickSavedFilter,     // j/k cycles through saved searches to apply
+    PromptSaveFilter,    // text input → name the current search and save it
     CommandPalette,
     /// QR + URL overlay for the in-TUI capture server. Any key
     /// dismisses; press `s` again to re-open without rebinding (the
@@ -147,6 +149,16 @@ impl Filter {
         self.project.is_some() || self.context.is_some() || !self.search.is_empty()
     }
 
+    /// The active `+project` / `@context` tags as an add-prompt prefix, with
+    /// a trailing space; empty when neither is set. A task added under a
+    /// filter that doesn't carry its tags drops out of the view the moment it
+    /// saves. `search` contributes nothing — it is a needle, not a tag.
+    pub fn tag_seed(&self) -> String {
+        let project = self.project.as_deref().map(|p| format!("+{p} "));
+        let context = self.context.as_deref().map(|c| format!("@{c} "));
+        project.unwrap_or_default() + &context.unwrap_or_default()
+    }
+
     /// Drop every filter component back to its empty state.
     pub fn clear(&mut self) {
         self.project = None;
@@ -162,4 +174,38 @@ impl Filter {
 pub struct SavedFilter {
     pub name: String,
     pub query: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Filter;
+
+    #[test]
+    fn tag_seed_is_empty_without_project_or_context() {
+        let filter = Filter {
+            search: "milk".to_string(),
+            ..Filter::default()
+        };
+        assert_eq!(filter.tag_seed(), "", "a search needle is not a tag");
+    }
+
+    #[test]
+    fn tag_seed_leads_with_project_then_context() {
+        let filter = Filter {
+            project: Some("work".to_string()),
+            context: Some("home".to_string()),
+            search: String::new(),
+        };
+        // Trailing space: the seed is a prefix the body gets typed after.
+        assert_eq!(filter.tag_seed(), "+work @home ");
+    }
+
+    #[test]
+    fn tag_seed_covers_a_single_active_filter() {
+        let filter = Filter {
+            context: Some("home".to_string()),
+            ..Filter::default()
+        };
+        assert_eq!(filter.tag_seed(), "@home ");
+    }
 }
